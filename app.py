@@ -1,0 +1,888 @@
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, send_file
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+import os
+import random
+import uuid
+import platform
+import sys
+import time
+import traceback
+import re
+from models import db, User, QuizAttempt, QuestionAnswer
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+from collections import Counter
+from supabase import create_client, Client
+from sqlalchemy import func
+from auth import auth_bp
+from admin import admin_bp
+from pdf_utils import pdf_generator
+
+# Print system information for debugging
+print(f"Python version: {platform.python_version()}")
+print(f"System: {platform.system()}")
+print(f"Platform: {platform.platform()}")
+print(f"Directory: {os.getcwd()}")
+print(f"Executable: {sys.executable}")
+
+# Try to load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Loaded environment variables from .env file")
+except ImportError:
+    print("python-dotenv not installed, using default environment variables")
+
+# Gemini is the AI provider for question generation and answer evaluation.
+try:
+    from gemini_service import (
+    generate_questions as gemini_generate_questions,
+    generate_model_answer as gemini_generate_model_answer,
+    evaluate_answer as gemini_evaluate_answer,
+    evaluate_answers_batch as gemini_evaluate_answers_batch,
+    generate_model_answers_batch as gemini_generate_model_answers_batch,
+)
+    print("Gemini service initialized successfully")
+except Exception as e:
+    raise RuntimeError(
+        "Could not initialize Gemini. Check GEMINI_API_KEY in your .env file "
+        "and ensure google-genai is installed."
+    ) from e
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'default-secret-key-for-dev')
+
+# Register blueprints
+app.register_blueprint(auth_bp, url_prefix='/auth')
+app.register_blueprint(admin_bp)
+
+# Health check endpoint
+@app.route('/health')
+def health_check():
+    status = {
+        'status': 'ok',
+        'timestamp': datetime.now().isoformat(),
+        'python_version': platform.python_version(),
+        'platform': platform.platform(),
+        'database_connected': False,
+        'supabase_connected': False,
+        'environment': 'production' if os.environ.get('RENDER') else 'development'
+    }
+    
+    # Check database connection
+    try:
+        db.session.execute("SELECT 1")
+        status['database_connected'] = True
+    except Exception as e:
+        status['database_error'] = str(e)
+    
+    # Check Supabase connection if configured
+    try:
+        supabase_url = os.environ.get('SUPABASE_URL')
+        supabase_key = os.environ.get('SUPABASE_KEY')
+        if supabase_url and supabase_key:
+            supabase = create_client(supabase_url, supabase_key)
+            # Simple query to test connection
+            response = supabase.table('users').select('count', count='exact').execute()
+            status['supabase_connected'] = True
+            status['supabase_user_count'] = response.count
+    except Exception as e:
+        status['supabase_error'] = str(e)
+    
+    return jsonify(status)
+
+# Configure database
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///interview_app.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize SQLAlchemy with the app
+db.init_app(app)
+
+# Initialize Flask-Login
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'auth.login'
+login_manager.login_message = 'Please log in to access this page.'
+login_manager.login_message_category = 'info'
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# Gemini replaces the previous Hugging Face model pipeline.
+# Keeping this flag False prevents unnecessary local model downloads.
+USE_MODELS = False
+print("AI provider: Google Gemini")
+
+hugging_face_generator = None
+hugging_face_evaluator = None
+
+# Define helper functions for generating questions and answers
+def generate_questions_template_based(subject, difficulty, num_questions=5):
+    """Generate questions using minimal templates - memory efficient"""
+    import random
+    
+    # Minimal question patterns - much smaller memory footprint
+    question_patterns = [
+        ("What", ["are the key concepts", "is the importance", "are the main benefits", "challenges exist"]),
+        ("How", ["do you implement", "can you optimize", "would you approach", "do you debug"]),
+        ("Explain", ["the process of", "the concept of", "how to use", "the differences between"]),
+        ("Describe", ["your experience with", "best practices for", "common use cases of", "the workflow for"]),
+        ("When", ["would you use", "is it appropriate to", "should you consider", "do you need"])
+    ]
+    
+    # Subject-specific terms (minimal set)
+    subject_terms = {
+        "Python Programming": ["functions", "classes", "modules", "data structures", "algorithms"],
+        "JavaScript": ["functions", "objects", "promises", "modules", "DOM manipulation"],
+        "Machine Learning": ["models", "algorithms", "data preprocessing", "evaluation", "deployment"],
+        "Data Science": ["analysis", "visualization", "statistics", "data cleaning", "insights"],
+        "Web Development": ["frontend", "backend", "APIs", "databases", "frameworks"],
+        "System Design": ["architecture", "scalability", "performance", "reliability", "components"]
+    }
+    
+    # Get terms for subject or use generic ones
+    terms = subject_terms.get(subject, ["concepts", "techniques", "tools", "methods", "approaches"])
+    
+    # Generate questions dynamically
+    questions = []
+    random.shuffle(question_patterns)
+    random.shuffle(terms)
+    
+    for i in range(num_questions):
+        pattern_type, pattern_list = question_patterns[i % len(question_patterns)]
+        pattern = pattern_list[i % len(pattern_list)]
+        term = terms[i % len(terms)]
+        
+        if pattern_type == "What":
+            question = f"What {pattern} in {subject}?"
+        elif pattern_type == "How":
+            question = f"How {pattern} {term} in {subject}?"
+        elif pattern_type == "Explain":
+            question = f"Explain {pattern} {term} in {subject}."
+        elif pattern_type == "Describe":
+            question = f"Describe {pattern} {subject}."
+        else:  # When
+            question = f"When {pattern} {term} in {subject}?"
+        
+        questions.append(question)
+    
+    return questions
+
+def generate_questions(subject, difficulty, num_questions=5, random_seed=None):
+    """Generate interview questions using the Gemini service."""
+    # random_seed is retained for compatibility with existing route calls.
+    return gemini_generate_questions(
+        subject=subject,
+        difficulty=difficulty,
+        num_questions=int(num_questions)
+    )
+
+def generate_contextual_answer(question, subject, difficulty):
+    """Generate an answer by analyzing the question context"""
+    question_lower = question.lower()
+    
+    # Extract key terms from the question
+    import re
+    key_terms = []
+    
+    # Look for quoted terms
+    quoted = re.findall(r'"([^"]*)"', question) + re.findall(r"'([^']*)'", question)
+    key_terms.extend(quoted)
+    
+    # Look for capitalized terms
+    capitalized = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', question)
+    key_terms.extend(capitalized)
+    
+    # Add the subject itself
+    if subject:
+        key_terms.append(subject)
+    
+    # Remove duplicates
+    key_terms = list(set([term.strip() for term in key_terms if term.strip()]))
+    
+    # Determine question type
+    if any(word in question_lower for word in ["what is", "define", "explain"]):
+        question_type = "definition"
+    elif any(word in question_lower for word in ["how to", "how do you", "steps", "process"]):
+        question_type = "process"
+    elif any(word in question_lower for word in ["why", "reason", "advantage", "benefit"]):
+        question_type = "reasoning"
+    elif any(word in question_lower for word in ["compare", "difference", "versus", "vs"]):
+        question_type = "comparison"
+    else:
+        question_type = "general"
+    
+    # Generate answer based on question type
+    if question_type == "definition":
+        return (f"In {subject}, {key_terms[0] if key_terms else 'this concept'} refers to an important principle or technique. "
+                f"It is characterized by specific attributes and behaviors that make it suitable for certain use cases. "
+                f"Understanding this concept requires knowledge of its core components and how they interact. "
+                f"The implementation details vary depending on the specific requirements and constraints of the project.")
+    
+    elif question_type == "process":
+        return (f"The process involves several key steps when working with {key_terms[0] if key_terms else subject}. "
+                f"First, you need to analyze the requirements and constraints of your specific situation. "
+                f"Then, identify the appropriate approach based on best practices in the field. "
+                f"Implementation typically requires careful consideration of efficiency, maintainability, and scalability. "
+                f"Testing and validation are essential to ensure the solution meets the expected outcomes.")
+    
+    elif question_type == "reasoning":
+        return (f"There are several important reasons why {key_terms[0] if key_terms else 'this approach'} is significant in {subject}. "
+                f"First, it addresses common challenges that practitioners face in real-world scenarios. "
+                f"Second, it offers advantages in terms of performance, reliability, or simplicity compared to alternatives. "
+                f"Additionally, it aligns with modern best practices and industry standards. "
+                f"Understanding these benefits helps inform better design and implementation decisions.")
+    
+    elif question_type == "comparison":
+        term1 = key_terms[0] if len(key_terms) > 0 else "the first approach"
+        term2 = key_terms[1] if len(key_terms) > 1 else "the alternative approach"
+        
+        return (f"When comparing {term1} and {term2} in {subject}, several key differences emerge. "
+                f"They differ in their underlying implementation details, performance characteristics, and use cases. "
+                f"{term1} might be more suitable in scenarios requiring specific attributes, while {term2} could be preferred in other contexts. "
+                f"The choice between them depends on factors such as project requirements, constraints, and trade-offs between different qualities.")
+    
+    else:  # General answer
+        return (f"This is an important concept in {subject} that requires thorough understanding. "
+                f"It encompasses multiple aspects including theoretical foundations and practical applications. "
+                f"When working with this concept, professionals need to consider various factors and trade-offs. "
+                f"Best practices involve careful planning, appropriate implementation techniques, and ongoing evaluation. "
+                f"Mastering this area contributes significantly to overall expertise in {subject}.")
+
+def generate_model_answer(question, subject, difficulty):
+    """Generate a reference answer using Google Gemini."""
+    return gemini_generate_model_answer(
+        question=question,
+        subject=subject,
+        difficulty=difficulty
+    )
+    
+def generate_model_answers_batch(questions, subject, difficulty):
+    """Generate reference answers using one Gemini API request."""
+    return gemini_generate_model_answers_batch(
+        questions=questions,
+        subject=subject,
+        difficulty=difficulty
+    )
+    
+def evaluate_answer(question, user_answer, model_answer=None, subject=None, difficulty=None):
+    """Evaluate a candidate's answer using Google Gemini."""
+    return gemini_evaluate_answer(
+        question=question,
+        user_answer=user_answer,
+        model_answer=model_answer,
+        subject=subject,
+        difficulty=difficulty
+    )
+def evaluate_answers_batch(questions, answers, subject, difficulty):
+    """Evaluate all answers using one Gemini API request."""
+    return gemini_evaluate_answers_batch(
+        questions=questions,
+        answers=answers,
+        subject=subject,
+        difficulty=difficulty
+    )
+    
+@app.route('/')
+def index():
+    """Render the enhanced landing page with app features and statistics"""
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    # Get some stats for the homepage
+    try:
+        total_users = User.query.count()
+        total_attempts = QuizAttempt.query.count()
+        total_questions = QuestionAnswer.query.count()
+        
+        # Get popular subjects
+        popular_subjects = db.session.query(
+            QuizAttempt.subject, 
+            func.count(QuizAttempt.id).label('count')
+        ).group_by(QuizAttempt.subject).order_by(
+            func.count(QuizAttempt.id).desc()
+        ).limit(8).all()
+        
+        stats = {
+            'total_users': total_users,
+            'total_attempts': total_attempts,
+            'total_questions': total_questions,
+            'popular_subjects': popular_subjects
+        }
+    except Exception as e:
+        print(f"Error fetching homepage stats: {e}")
+        stats = {
+            'total_users': 0,
+            'total_attempts': 0,
+            'total_questions': 0,
+            'popular_subjects': []
+        }
+    
+    return render_template('landing.html', stats=stats)
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    """Render user dashboard with stats and attempt history."""
+    # Get user's quiz attempts
+    attempts = QuizAttempt.query.filter_by(user_id=current_user.id).order_by(QuizAttempt.timestamp.desc()).all()
+    
+    # Calculate stats
+    total_attempts = len(attempts)
+    total_questions = QuestionAnswer.query.join(QuizAttempt).filter(QuizAttempt.user_id == current_user.id).count()
+    
+    # Calculate average score
+    average_score = 0
+    if total_attempts > 0:
+        total_score = sum(attempt.average_score for attempt in attempts)
+        average_score = total_score / total_attempts
+    
+    stats = {
+        'total_attempts': total_attempts,
+        'total_questions': total_questions,
+        'average_score': average_score
+    }
+    
+    # Prepare score data for chart
+    score_data = {
+        'dates': [],
+        'scores': []
+    }
+    
+    # Get last 10 attempts for the chart
+    recent_attempts = attempts[:10]
+    for attempt in recent_attempts:
+        score_data['dates'].append(attempt.timestamp.strftime('%m/%d/%Y'))
+        score_data['scores'].append(round(attempt.average_score, 1))
+    
+    # Reverse to show chronological order
+    score_data['dates'].reverse()
+    score_data['scores'].reverse()
+    
+    # Prepare subject distribution data
+    subject_counts = Counter([attempt.subject for attempt in attempts])
+    subject_data = {
+        'subjects': list(subject_counts.keys()),
+        'counts': list(subject_counts.values())
+    }
+    
+    return render_template('dashboard.html', 
+                          attempts=attempts, 
+                          stats=stats, 
+                          score_data=score_data, 
+                          subject_data=subject_data)
+
+@app.route('/quiz')
+@login_required
+def quiz():
+    """Render quiz page"""
+    return render_template('quiz.html')
+
+@app.route('/leaderboard')
+@login_required
+def leaderboard():
+    """Show top users based on average score"""
+    try:
+        # Get users with at least 3 attempts
+        users_with_attempts = db.session.query(
+            User.id, 
+            User.username,
+            func.count(QuizAttempt.id).label('attempt_count')
+        ).join(QuizAttempt).group_by(User.id).having(
+            func.count(QuizAttempt.id) >= 3
+        ).subquery()
+        
+        # Get average scores for these users
+        top_users_query = db.session.query(
+            users_with_attempts.c.username,
+            users_with_attempts.c.id,
+            users_with_attempts.c.attempt_count,
+            func.avg(QuizAttempt.average_score).label('avg_score')
+        ).join(
+            QuizAttempt, 
+            QuizAttempt.user_id == users_with_attempts.c.id
+        ).group_by(
+            users_with_attempts.c.username,
+            users_with_attempts.c.id,
+            users_with_attempts.c.attempt_count
+        ).order_by(
+            func.avg(QuizAttempt.average_score).desc()
+        ).limit(10).all()
+        
+        # Format the results
+        result = []
+        for user in top_users_query:
+            user_dict = {
+                'username': user.username,
+                'avg_score': user.avg_score,
+                'attempt_count': user.attempt_count
+            }
+            
+            # Get the latest attempt for this user
+            latest_attempt = QuizAttempt.query.filter_by(user_id=user.id).order_by(QuizAttempt.timestamp.desc()).first()
+            if latest_attempt:
+                user_dict['last_attempt'] = latest_attempt.timestamp
+            else:
+                user_dict['last_attempt'] = None
+                
+            result.append(user_dict)
+        
+        return render_template('leaderboard.html', top_users=result)
+    except Exception as e:
+        import traceback
+        app.logger.error(f"Error in leaderboard route: {str(e)}")
+        app.logger.error(traceback.format_exc())
+        flash(f"An error occurred while loading the leaderboard. Please try again later.", "danger")
+        return redirect(url_for('dashboard'))
+
+@app.route('/attempt/<int:attempt_id>')
+@login_required
+def view_attempt(attempt_id):
+    """View details of a specific quiz attempt."""
+    attempt = QuizAttempt.query.get_or_404(attempt_id)
+    
+    # Ensure the attempt belongs to the current user
+    if attempt.user_id != current_user.id:
+        flash('You do not have permission to view this attempt', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    # Get all answers for this attempt
+    answers = QuestionAnswer.query.filter_by(attempt_id=attempt_id).all()
+    
+    return render_template('attempt.html', attempt=attempt, answers=answers)
+
+@app.route('/generate_questions', methods=['POST'])
+def generate_questions_route():
+    """Generate questions based on the subject and difficulty."""
+    # Check if the request is JSON or form data
+    if request.is_json:
+        data = request.json
+        subject = data.get('subject', '').strip()
+        difficulty = data.get('difficulty', 'Medium').strip()
+        refresh = data.get('refresh') == 'true'
+        add_more = data.get('add_more') == 'true'
+        num_questions = data.get('num_questions', 10)
+    else:
+        subject = request.form.get('subject', '').strip()
+        difficulty = request.form.get('difficulty', 'Medium').strip()
+        refresh = request.form.get('refresh') == 'true'
+        add_more = request.form.get('add_more') == 'true'
+        num_questions = int(request.form.get('num_questions', 10))
+    
+    if not subject:
+        return jsonify({"success": False, "error": "Please enter a subject"}), 400
+    
+    try:
+        # Add random seed parameter to ensure different questions each time
+        import time
+        # Use a combination of time, random number, and subject/difficulty to create a unique seed
+        seed_components = [str(time.time()), str(random.randint(1, 1000000)), subject, difficulty]
+        combined_seed = ''.join(seed_components)
+        # Convert the string to a number by summing character values
+        random_seed = sum(ord(c) for c in combined_seed) % 1000000
+        print(f"Using random seed: {random_seed} for {subject}/{difficulty}")
+        
+        # Clear any previous questions from session to avoid influence
+        if 'previous_questions' not in session:
+            session['previous_questions'] = []
+        
+        # If refreshing, generate completely new questions
+        if refresh:
+            questions = generate_questions(subject, difficulty, num_questions, random_seed=random_seed)
+            
+            # Store in session for later use
+            session['questions'] = questions
+            session['subject'] = subject
+            session['difficulty'] = difficulty
+            
+            # Store these questions in previous_questions to avoid repetition in future
+            prev_questions = session.get('previous_questions', [])
+            prev_questions.extend(questions)
+            # Keep only the last 50 questions to avoid session bloat
+            if len(prev_questions) > 50:
+                prev_questions = prev_questions[-50:]
+            session['previous_questions'] = prev_questions
+            
+            # Generate reference answers lazily during evaluation, not here.
+            # This keeps question generation to a single Gemini request.
+            session['model_answers'] = [None] * len(questions)
+            
+            return jsonify({"success": True, "questions": questions})
+            
+        # If adding more questions
+        elif add_more:
+            # Get current questions
+            current_questions = session.get('questions', [])
+            
+            # Generate additional questions
+            additional_questions = generate_questions(subject, difficulty, random_seed=random_seed)
+            
+            # Make sure we don't have duplicates
+            unique_additional = [q for q in additional_questions if q not in current_questions]
+            
+            # Defer reference-answer generation until evaluation.
+            # This avoids one extra Gemini request per new question.
+            # Update session
+            session['questions'] = current_questions + unique_additional
+            session['model_answers'] = session.get('model_answers', []) + [None] * len(unique_additional)
+            
+            return jsonify({"success": True, "questions": unique_additional})
+            
+        # Regular question generation
+        else:
+            questions = generate_questions(subject, difficulty, num_questions, random_seed=random_seed)
+            
+            # Store in session for later use
+            session['questions'] = questions
+            session['subject'] = subject
+            session['difficulty'] = difficulty
+            
+            # Store these questions in previous_questions to avoid repetition in future
+            prev_questions = session.get('previous_questions', [])
+            prev_questions.extend(questions)
+            # Keep only the last 50 questions to avoid session bloat
+            if len(prev_questions) > 50:
+                prev_questions = prev_questions[-50:]
+            session['previous_questions'] = prev_questions
+            
+            # Generate reference answers lazily during evaluation, not here.
+            # This keeps question generation to a single Gemini request.
+            session['model_answers'] = [None] * len(questions)
+            
+            return jsonify({"success": True, "questions": questions})
+            
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/evaluate_answers', methods=['POST'])
+def evaluate_answers_route():
+    """Evaluate the user's answers."""
+    try:
+        questions = session.get('questions', [])
+        subject = session.get('subject', 'General')
+        difficulty = session.get('difficulty', 'Medium')
+        model_answers = session.get('model_answers', [])
+        
+        print(f"Evaluating {len(questions)} questions for subject: {subject}, difficulty: {difficulty}")
+        
+        # Check if the request is JSON or form data
+                # Check if the request is JSON or form data
+        if request.is_json:
+            data = request.json
+            answers = data.get('answers', [])
+        else:
+            answers = request.form.getlist('answers[]')
+
+        # Validate that all answers are filled
+        if any(not isinstance(answer, str) or not answer.strip() for answer in answers):
+            return jsonify({
+                "success": False,
+                "error": "Please answer all questions before submitting."
+            }), 400
+
+        if len(questions) != len(answers):
+            return jsonify({
+                "success": False,
+                "error": f"Questions and answers count mismatch: {len(questions)} questions vs {len(answers)} answers"
+            }), 400
+        
+        # Generate reference answers if they are not already available
+        model_answers = session.get('model_answers', [])
+
+        if (
+            len(model_answers) != len(questions)
+            or any(not isinstance(answer, str) or not answer.strip()
+                for answer in model_answers)
+        ):
+            print("Generating reference answers using Gemini...")
+
+        model_answers = generate_model_answers_batch(
+            questions,
+            subject,
+            difficulty
+        )
+
+        session['model_answers'] = model_answers
+        session.modified = True
+
+        print("Reference answers generated successfully.")
+        
+        evaluations = []
+        total_score = 0
+
+        print("Sending all answers to Gemini for batch evaluation...")
+
+        batch_results = evaluate_answers_batch(
+            questions,
+            answers,
+            subject,
+            difficulty
+        )
+
+        for i, (question, answer) in enumerate(zip(questions, answers)):
+
+            evaluation = batch_results[i]
+            total_score += evaluation['rating']
+
+            model_answer = (
+                model_answers[i]
+                if i < len(model_answers) and model_answers[i]
+                else ""
+            )
+
+            evaluations.append({
+                "question": question,
+                "answer": answer,
+                "model_answer": model_answer,
+                "evaluation": evaluation
+            })
+
+        average_score = total_score / len(evaluations) if evaluations else 0
+        print(f"Average score: {average_score}")
+        
+        # Save the quiz attempt if user is logged in
+        if current_user.is_authenticated:
+            try:
+                print(f"Saving quiz attempt for user {current_user.id}")
+                quiz_attempt = QuizAttempt(
+                    user_id=current_user.id,
+                    subject=subject,
+                    difficulty=difficulty,
+                    average_score=average_score
+                )
+                db.session.add(quiz_attempt)
+                db.session.flush()  # Get ID without committing
+                
+                # Save individual question answers one at a time using explicit transactions
+                for i, item in enumerate(evaluations):
+                    try:
+                        print(f"Saving answer {i+1} with correctness: {item['evaluation']['correctness']}")
+                        # Clean and truncate any problematic strings
+                        question_text = item['question'] if item['question'] else ""
+                        user_answer = item['answer'] if item['answer'] else ""
+                        model_answer = item['model_answer'] if item['model_answer'] else ""
+                        correctness = item['evaluation']['correctness'] if item['evaluation']['correctness'] else "No rating"
+                        feedback = item['evaluation']['feedback'] if item['evaluation']['feedback'] else ""
+                        
+                        # Create the question answer object with truncated values if needed
+                        def safe_truncate(text, max_length=10000):
+                            """Safely truncate text to a maximum length while preserving meaningful content"""
+                            if not text or len(text) <= max_length:
+                                return text
+                            # Return the first part + indication of truncation
+                            return text[:max_length-30] + "... [truncated for storage]"
+                            
+                        question_answer = QuestionAnswer(
+                            attempt_id=quiz_attempt.id,
+                            question_text=safe_truncate(question_text),
+                            user_answer=safe_truncate(user_answer),
+                            model_answer=safe_truncate(model_answer),
+                            correctness=correctness[:100] if correctness else "Unknown",  # Limit to reasonable size
+                            score=item['evaluation']['rating'],
+                            feedback=safe_truncate(feedback, 5000)
+                        )
+                        
+                        # Add and flush each answer individually
+                        db.session.add(question_answer)
+                        db.session.flush()
+                        print(f"Successfully saved answer {i+1}")
+                    except Exception as answer_error:
+                        print(f"Error saving answer {i+1}: {answer_error}")
+                        # Continue with other answers even if one fails
+                
+                try:
+                    db.session.commit()
+                    print("Database commit successful")
+                    return jsonify({"success": True, "evaluations": evaluations, "attempt_id": quiz_attempt.id})
+                except Exception as commit_error:
+                    db.session.rollback()
+                    print(f"Database commit error: {commit_error}")
+                    traceback.print_exc()
+                    # Try again without the question answers
+                    try:
+                        # Just save the attempt without details
+                        simple_attempt = QuizAttempt(
+                            user_id=current_user.id,
+                            subject=subject,
+                            difficulty=difficulty,
+                            average_score=average_score
+                        )
+                        db.session.add(simple_attempt)
+                        db.session.commit()
+                        print("Saved attempt without detailed answers")
+                        return jsonify({
+                            "success": True, 
+                            "evaluations": evaluations, 
+                            "attempt_id": simple_attempt.id,
+                            "warning": "Could not save detailed answers"
+                        })
+                    except Exception as simple_error:
+                        db.session.rollback()
+                        print(f"Failed to save simple attempt: {simple_error}")
+                        traceback.print_exc()
+                        return jsonify({"success": False, "error": "Could not save your answers to the database. Please try again."}), 500
+            except Exception as db_error:
+                db.session.rollback()
+                print(f"Database error: {db_error}")
+                traceback.print_exc()
+                return jsonify({"success": False, "error": f"Database error: {str(db_error)}"}), 500
+        else:
+            # For users not logged in, just return evaluations
+            return jsonify({"success": True, "evaluations": evaluations})
+    except Exception as e:
+        print(f"Evaluation error: {e}")
+        traceback.print_exc()
+        return jsonify({"success": False, "error": f"Error evaluating answers: {str(e)}"}), 500
+
+@app.route('/download/questions-pdf', methods=['POST'])
+@login_required
+def download_questions_pdf():
+    """Download generated questions as PDF"""
+    questions = session.get('questions', [])
+    subject = session.get('subject', 'General')
+    difficulty = session.get('difficulty', 'Medium')
+    
+    if not questions:
+        flash('No questions to download. Please generate questions first.', 'warning')
+        return redirect(url_for('quiz'))
+    
+    # Generate PDF
+    pdf_buffer = pdf_generator.generate_questions_pdf(questions, subject, difficulty)
+    
+    return send_file(
+        pdf_buffer,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'interview_questions_{subject}_{difficulty}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
+    )
+
+@app.route('/download/evaluation-pdf/<int:attempt_id>')
+@login_required
+def download_evaluation_pdf(attempt_id):
+    """Download evaluation report as PDF"""
+    attempt = QuizAttempt.query.get_or_404(attempt_id)
+    
+    # Ensure the attempt belongs to the current user
+    if attempt.user_id != current_user.id:
+        flash('You do not have permission to access this report', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    # Get all answers for this attempt
+    questions_answers = QuestionAnswer.query.filter_by(attempt_id=attempt_id).all()
+    
+    # Generate PDF
+    pdf_buffer = pdf_generator.generate_evaluation_pdf(attempt, questions_answers)
+    
+    return send_file(
+        pdf_buffer,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'evaluation_report_{attempt.subject}_{attempt.timestamp.strftime("%Y%m%d_%H%M%S")}.pdf'
+    )
+
+@app.route('/api/theme', methods=['POST'])
+@login_required
+def toggle_theme():
+    """Toggle dark/light theme"""
+    theme = request.json.get('theme', 'light')
+    session['theme'] = theme
+    return jsonify({'theme': theme})
+
+# Initialize Supabase client
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_KEY")
+
+if supabase_url and supabase_key:
+    supabase: Client = create_client(supabase_url, supabase_key)
+    print("Supabase client initialized successfully")
+else:
+    print("Supabase credentials not found in environment variables")
+    supabase = None
+
+# Update the database connection to use PostgreSQL via Supabase
+# Replace your existing SQLite connection with:
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///interview_app.db')
+
+# Create database tables within application context
+with app.app_context():
+    db.create_all()
+
+# Ensure PostgreSQL URLs from Supabase are correctly formatted for SQLAlchemy
+if app.config['SQLALCHEMY_DATABASE_URI'].startswith("postgres://"):
+    app.config['SQLALCHEMY_DATABASE_URI'] = app.config['SQLALCHEMY_DATABASE_URI'].replace("postgres://", "postgresql://", 1)
+
+def generate_contextual_answer(question, subject, difficulty):
+    """Generate an answer by analyzing the question context"""
+    question_lower = question.lower()
+    
+    # Extract key terms from the question
+    import re
+    key_terms = []
+    
+    # Look for quoted terms
+    quoted = re.findall(r'"([^"]*)"', question) + re.findall(r"'([^']*)'", question)
+    key_terms.extend(quoted)
+    
+    # Look for capitalized terms
+    capitalized = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', question)
+    key_terms.extend(capitalized)
+    
+    # Add the subject itself
+    if subject:
+        key_terms.append(subject)
+    
+    # Remove duplicates
+    key_terms = list(set([term.strip() for term in key_terms if term.strip()]))
+    
+    # Determine question type
+    if any(word in question_lower for word in ["what is", "define", "explain"]):
+        question_type = "definition"
+    elif any(word in question_lower for word in ["how to", "how do you", "steps", "process"]):
+        question_type = "process"
+    elif any(word in question_lower for word in ["why", "reason", "advantage", "benefit"]):
+        question_type = "reasoning"
+    elif any(word in question_lower for word in ["compare", "difference", "versus", "vs"]):
+        question_type = "comparison"
+    else:
+        question_type = "general"
+    
+    # Generate answer based on question type
+    if question_type == "definition":
+        return (f"In {subject}, {key_terms[0] if key_terms else 'this concept'} refers to an important principle or technique. "
+                f"It is characterized by specific attributes and behaviors that make it suitable for certain use cases. "
+                f"Understanding this concept requires knowledge of its core components and how they interact. "
+                f"The implementation details vary depending on the specific requirements and constraints of the project.")
+    
+    elif question_type == "process":
+        return (f"The process involves several key steps when working with {key_terms[0] if key_terms else subject}. "
+                f"First, you need to analyze the requirements and constraints of your specific situation. "
+                f"Then, identify the appropriate approach based on best practices in the field. "
+                f"Implementation typically requires careful consideration of efficiency, maintainability, and scalability. "
+                f"Testing and validation are essential to ensure the solution meets the expected outcomes.")
+    
+    elif question_type == "reasoning":
+        return (f"There are several important reasons why {key_terms[0] if key_terms else 'this approach'} is significant in {subject}. "
+                f"First, it addresses common challenges that practitioners face in real-world scenarios. "
+                f"Second, it offers advantages in terms of performance, reliability, or simplicity compared to alternatives. "
+                f"Additionally, it aligns with modern best practices and industry standards. "
+                f"Understanding these benefits helps inform better design and implementation decisions.")
+    
+    elif question_type == "comparison":
+        term1 = key_terms[0] if len(key_terms) > 0 else "the first approach"
+        term2 = key_terms[1] if len(key_terms) > 1 else "the alternative approach"
+        
+        return (f"When comparing {term1} and {term2} in {subject}, several key differences emerge. "
+                f"They differ in their underlying implementation details, performance characteristics, and use cases. "
+                f"{term1} might be more suitable in scenarios requiring specific attributes, while {term2} could be preferred in other contexts. "
+                f"The choice between them depends on factors such as project requirements, constraints, and trade-offs between different qualities.")
+    
+    else:  # General answer
+        return (f"This is an important concept in {subject} that requires thorough understanding. "
+                f"It encompasses multiple aspects including theoretical foundations and practical applications. "
+                f"When working with this concept, professionals need to consider various factors and trade-offs. "
+                f"Best practices involve careful planning, appropriate implementation techniques, and ongoing evaluation. "
+                f"Mastering this area contributes significantly to overall expertise in {subject}.")
+
+if __name__ == '__main__':
+    app.run(debug=True)

@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# Environment Variables
+.env
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Model files (optionally cached locally)
+models/
+
+# Logs
+*.log
+logs/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Flask
+instance/
+.webassets-cache
+
+# PyTorch
+*.pt
+*.pth
+
+# Test files and scripts
+test_*.py
+*_test.py
+test_*.bat
+*_test.bat
+create_test_user.py
+fix_*.py
+fix_*.bat
+migrate_*.py
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Database files (keep instance/ folder but ignore db files for now)
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache and temporary files
+.cache/
+temp/
+tmp/
